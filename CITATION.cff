@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use claude-desktop-watchdog in research or software, please cite it as below."
+title: "claude-desktop-watchdog"
+type: software
+authors:
+  - family-names: Dziatkovskii
+    given-names: Anton
+    orcid: "https://orcid.org/0000-0001-7408-3054"
+    affiliation: "Palo Alto AI Research Lab"
+repository-code: "https://github.com/tonydzi/claude-desktop-watchdog"
+url: "https://github.com/tonydzi/claude-desktop-watchdog"
+license: MIT
+abstract: >-
+  A single-file PowerShell watchdog for Claude Desktop on Windows, where a dead or wedged
+  instance keeps holding the single-instance lock, so clicking the icon is swallowed by a
+  process that will never draw a window again and only a reboot recovers. It reaps exactly
+  two classes of survivor: processes whose executable path is outside the InstallLocation
+  that Get-AppxPackage reports now, which is what an interrupted MSIX update leaves behind,
+  and instances whose windows stop responding across two consecutive ticks on the same pid.
+  A window ping is not a diagnosis, so the hang branch is fenced with a startup grace, a
+  stale-state cutoff, a one-live-window veto and a crash-loop brake, and it fails open:
+  a missed heal costs a manual restart, a false one costs the user's work. Every healing run
+  first writes an incident snapshot - package status, process list with paths, application
+  log tail, AppX deployment events - because the failure survives mainly by leaving no
+  evidence behind once the machine is healthy again.
+keywords:
+  - claude-desktop
+  - watchdog
+  - windows
+  - msix
+  - single-instance-lock
+  - reliability
+  - incident-evidence
