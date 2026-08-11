@@ -11,7 +11,7 @@ One PowerShell file. No modules, no network, no telemetry. MIT.
 ```powershell
 git clone https://github.com/tonydzi/claude-desktop-watchdog
 cd claude-desktop-watchdog
-powershell -ExecutionPolicy Bypass -File .\claude_desktop_watchdog.ps1 -SelfTest   # 20 fixtures, changes nothing
+powershell -ExecutionPolicy Bypass -File .\claude_desktop_watchdog.ps1 -SelfTest   # 22 fixtures, changes nothing
 powershell -ExecutionPolicy Bypass -File .\claude_desktop_watchdog.ps1 -Install    # every 5 min, Scheduled Task
 ```
 
@@ -50,7 +50,10 @@ the app is merely busy and during the first seconds of startup. Everything here 
 that one weakness.
 
 - **Two consecutive ticks on the same pid.** A different pid means the app already
-  restarted, so the counter starts over rather than inheriting someone else's freeze.
+  restarted, so the counter starts over rather than inheriting someone else's freeze. The
+  tracked pid is the one from last tick if it is still wedged, otherwise the lowest — not
+  "first in the array", because `Get-Process` order is not guaranteed and with two wedged
+  windows the counter would hop between pids and never reach two.
 - **90-second startup grace.** A window that has not finished coming up is not wedged.
 - **State older than 20 minutes is stale.** Sleep, reboot, and skipped ticks must not add
   up to "two ticks in a row" across a weekend.
@@ -82,9 +85,10 @@ processes and relaunching recovers it") and [#69987](https://github.com/anthropi
 (an update aborts with `0x80073D02`, "the package could not be installed because the
 following app must be closed", leaving the package unable to launch).
 
-What we verified on our own machine: both decision tables against 20 fixtures, including
+What we verified on our own machine: both decision tables against 22 fixtures, including
 the state file round-trip and a deliberately corrupted one; the self-test going red under
-two mutations (heal on the first tick, ignore a responding window); a live run on a healthy
+three mutations (heal on the first tick, ignore a responding window, pick the target by
+array position); a live run on a healthy
 install and from the Scheduled Task itself (correctly does nothing, logs
 `hung=no (a window is responding)`); the launch path
 `explorer.exe shell:AppsFolder\<PackageFamilyName>!Claude`; and install/uninstall of the

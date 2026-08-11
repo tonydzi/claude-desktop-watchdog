@@ -115,7 +115,13 @@ function Get-HungVerdict {
     if ($oldest -lt $MinAgeSec) {
         return @{ Verdict = 'NONE'; Count = 0; ProcId = 0; Reason = "startup grace (oldest ${oldest}s < ${MinAgeSec}s)" }
     }
-    $target = [int](@($Windowed)[0].ProcId)
+    # Which one we are counting. Not "first in the array": Get-Process order is not
+    # guaranteed, so with TWO wedged windows the counter would hop between pids and never
+    # reach two. Keep following the pid from last tick if it is still wedged; otherwise the
+    # lowest, which is stable whatever order the list arrives in.
+    $ids    = @(@($Windowed) | ForEach-Object { [int]$_.ProcId } | Sort-Object)
+    $target = [int]$ids[0]
+    if ($Prior -and ($ids -contains [int]$Prior.pid)) { $target = [int]$Prior.pid }
     $count  = 1
     $why    = 'first not-responding tick'
     if ($Prior -and [int]$Prior.pid -eq $target -and ($NowEpoch - [double]$Prior.ts) -le $MaxGapSec) {
@@ -236,7 +242,9 @@ if ($SelfTest) {
         @{ n = 'hung: stale state = first tick';   w = @($hung);      p = @{ pid = 42; count = 1; ts = ($NOW - 9000) }; want = 'ARM' },
         @{ n = 'hung: different pid = restart';    w = @($hung);      p = @{ pid = 7;  count = 1; ts = ($NOW - 300) };  want = 'ARM' },
         @{ n = 'hung: young process is not judged'; w = @(@{ ProcId = 42; Responding = $false; AgeSec = 10 }); p = $armed; want = 'NONE' },
-        @{ n = 'hung: one of two windows alive';   w = @($hung, @{ ProcId = 43; Responding = $true; AgeSec = 600 }); p = $armed; want = 'NONE' }
+        @{ n = 'hung: one of two windows alive';   w = @($hung, @{ ProcId = 43; Responding = $true; AgeSec = 600 }); p = $armed; want = 'NONE' },
+        # two wedged windows: array order must not reset the counter
+        @{ n = 'hung: two wedged, keep following the tracked pid'; w = @(@{ ProcId = 43; Responding = $false; AgeSec = 600 }, $hung); p = $armed; want = 'HEAL' }
     )
     foreach ($c in $hcases) {
         $r = Get-HungVerdict -Windowed $c.w -Prior $c.p -NowEpoch $NOW
@@ -253,7 +261,12 @@ if ($SelfTest) {
     $r = Get-HungVerdict -Windowed @($hung) -Prior $armed -NowEpoch $NOW -RecentHeals $oldHeals
     if ($r.Verdict -eq 'HEAL') { Write-Output "PASS: hung: yesterday's heals do not brake" }
     else { Write-Output "FAIL: hung: stale heals -> got '$($r.Verdict)', want 'HEAL'"; $fail++ }
-    $total = $cases.Count + $hcases.Count + 2
+    # with no prior state the target is picked deterministically (lowest pid), not "first in the array"
+    $r1 = Get-HungVerdict -Windowed @(@{ ProcId = 77; Responding = $false; AgeSec = 600 }, @{ ProcId = 42; Responding = $false; AgeSec = 600 }) -Prior $null -NowEpoch $NOW
+    $r2 = Get-HungVerdict -Windowed @(@{ ProcId = 42; Responding = $false; AgeSec = 600 }, @{ ProcId = 77; Responding = $false; AgeSec = 600 }) -Prior $null -NowEpoch $NOW
+    if ($r1.ProcId -eq 42 -and $r2.ProcId -eq 42) { Write-Output 'PASS: hung: the target does not depend on process order' }
+    else { Write-Output "FAIL: hung: target depends on order ($($r1.ProcId) vs $($r2.ProcId))"; $fail++ }
+    $total = $cases.Count + $hcases.Count + 3
 
     # --- the counter travels through DISK, so test that wiring too ---------------------
     $realState = $StateFile
@@ -330,9 +343,18 @@ try {
             $windowed = @($desktopProcs |
                 Where-Object { $_.MainWindowHandle -ne 0 -and $_.Path -like "$loc*" } |
                 ForEach-Object {
-                    $age = 99999
-                    try { $age = [int]((Get-Date) - $_.StartTime).TotalSeconds } catch { }
-                    @{ ProcId = $_.Id; Responding = $_.Responding; AgeSec = $age }
+                    # The process can die between Get-Process and the property read, and
+                    # .Responding then throws -- with $ErrorActionPreference = 'Stop' that
+                    # would crash the whole watchdog for nothing. Gone -> simply not judged;
+                    # all gone -> $windowed is empty -> NONE, and Get-Decision handles
+                    # "the app is not running" on the next tick.
+                    $resp = $null
+                    try { $resp = [bool]$_.Responding } catch { }
+                    if ($null -ne $resp) {
+                        $age = 99999
+                        try { $age = [int]((Get-Date) - $_.StartTime).TotalSeconds } catch { }
+                        @{ ProcId = $_.Id; Responding = $resp; AgeSec = $age }
+                    }
                 })
             $v = Get-HungVerdict -Windowed $windowed -Prior $st -NowEpoch $now -RecentHeals $heals
             switch ($v.Verdict) {
