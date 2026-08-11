@@ -17,6 +17,23 @@
   Get-AppxPackage reports right now. After an MSIX update that is exactly what a survivor
   of the previous package looks like.
 
+  Second class, added in v0.2 -- the app is RUNNING but WEDGED. Processes are alive and
+  current, the window is dead, and clicking the icon does nothing because the frozen
+  instance still owns the single-instance lock. When the OK branch is reached, the windowed
+  process is pinged:
+
+    a window is responding                 -> OK
+    every window not responding, 1st tick  -> HUNG_ARMED (nothing killed)
+    every window not responding, 2nd tick  -> evidence, kill ALL Desktop procs, relaunch
+    3 heals within 6 hours                 -> HUNG_BRAKE (stop healing, this needs a human)
+
+  Why two ticks. Responding is a ping of the UI thread; it goes false while the app is
+  merely busy and during the first seconds of startup. So: two consecutive ticks (~10 min)
+  on the SAME pid, a 90 s startup grace, and state older than 20 minutes (sleep, reboot,
+  missed ticks) counts as a first tick rather than a second one. If the window is minimized
+  to the tray, MainWindowHandle is 0, there is no windowed process, and nothing is judged --
+  failing open beats killing a healthy app.
+
   What it never touches:
     - claude-code CLI processes (%APPDATA%\Claude\claude-code\<ver>\claude.exe).
       The filter is strictly 'C:\Program Files\WindowsApps\Claude_*'.
@@ -51,6 +68,7 @@ $TaskName    = 'Claude-Desktop-Watchdog'
 $DesktopGlob = 'C:\Program Files\WindowsApps\Claude_*'
 $LogDir      = Join-Path $env:USERPROFILE '.claude\logs'
 $LogFile     = Join-Path $LogDir 'claude_desktop_watchdog.jsonl'
+$StateFile   = Join-Path $LogDir 'claude_desktop_watchdog.state'
 $IncidentDir = Join-Path $LogDir 'desktop-incidents'
 
 function Get-Decision {
@@ -62,6 +80,79 @@ function Get-Decision {
     if ($current.Count -gt 0 -and $stale.Count -eq 0) { return 'OK' }
     if ($current.Count -gt 0 -and $stale.Count -gt 0) { return 'KILL_STALE_ONLY' }
     return 'KILL_STALE_AND_LAUNCH'
+}
+
+function Get-HungVerdict {
+    <# The whole "is it wedged" decision, as a pure function: no processes, no disk, so it
+       can be tested. Every rule below exists because of a specific way this can go wrong.
+
+       -Windowed     @( @{ ProcId=<int>; Responding=<bool>; AgeSec=<int> } ) -- windowed
+                     processes of the CURRENT version only
+       -Prior        last tick's state @{ pid; count; ts } or $null
+       -NowEpoch     current time in epoch seconds (passed in, not read, so tests can lie)
+       -RecentHeals  epoch seconds of previous heals (crash-loop brake)
+
+       Returns @{ Verdict = 'NONE'|'ARM'|'HEAL'|'BRAKE'; Count; ProcId; Reason } #>
+    param(
+        [array]$Windowed,
+        $Prior,
+        [double]$NowEpoch,
+        [array]$RecentHeals = @(),
+        [int]$MaxGapSec  = 1200,
+        [int]$MinAgeSec  = 90,
+        [int]$MaxHeals6h = 3
+    )
+    # No windowed process: minimized to tray, or the app is simply not up. Judge nothing.
+    if (-not $Windowed -or @($Windowed).Count -eq 0) {
+        return @{ Verdict = 'NONE'; Count = 0; ProcId = 0; Reason = 'no windowed process (tray or not running)' }
+    }
+    # One live window is enough. Otherwise a second, wedged window would cost you the healthy one.
+    foreach ($w in $Windowed) {
+        if ($w.Responding) { return @{ Verdict = 'NONE'; Count = 0; ProcId = 0; Reason = 'a window is responding' } }
+    }
+    # A window legitimately does not answer while the app is still coming up.
+    $oldest = (@($Windowed) | ForEach-Object { [int]$_.AgeSec } | Measure-Object -Maximum).Maximum
+    if ($oldest -lt $MinAgeSec) {
+        return @{ Verdict = 'NONE'; Count = 0; ProcId = 0; Reason = "startup grace (oldest ${oldest}s < ${MinAgeSec}s)" }
+    }
+    $target = [int](@($Windowed)[0].ProcId)
+    $count  = 1
+    $why    = 'first not-responding tick'
+    if ($Prior -and [int]$Prior.pid -eq $target -and ($NowEpoch - [double]$Prior.ts) -le $MaxGapSec) {
+        # Same pid, fresh state: this really is the second tick of one freeze.
+        $count = [int]$Prior.count + 1
+        $why   = "not responding $count ticks in a row (pid $target)"
+    } elseif ($Prior -and [int]$Prior.pid -eq $target) {
+        $why = "stale state, gap $([int]($NowEpoch - [double]$Prior.ts))s -- counting from 1"
+    } elseif ($Prior -and [int]$Prior.pid -ne 0) {
+        $why = "different pid (was $([int]$Prior.pid), now $target) -- counting from 1"
+    }
+    if ($count -lt 2) { return @{ Verdict = 'ARM'; Count = $count; ProcId = $target; Reason = $why } }
+    $fresh = @(@($RecentHeals) | Where-Object { $_ -and ($NowEpoch - [double]$_) -le 21600 })
+    if ($fresh.Count -ge $MaxHeals6h) {
+        return @{ Verdict = 'BRAKE'; Count = $count; ProcId = $target
+                  Reason = "$($fresh.Count) heals in the last 6h -- crash loop, a restart is not the fix" }
+    }
+    return @{ Verdict = 'HEAL'; Count = $count; ProcId = $target; Reason = $why }
+}
+
+function Read-HungState {
+    # Missing or corrupt file means "clean slate", never a crash of the watchdog itself.
+    if (-not (Test-Path $StateFile)) { return $null }
+    try {
+        $j = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        return @{ pid = [int]$j.pid; count = [int]$j.count; ts = [double]$j.ts; heals = @($j.heals) }
+    } catch { return $null }
+}
+
+function Write-HungState {
+    param([int]$TargetPid, [int]$Count, [double]$Ts, [array]$Heals)
+    try {
+        if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force $LogDir | Out-Null }
+        $keep = @(@($Heals) | Where-Object { $_ -and ($Ts - [double]$_) -le 86400 })   # 24h, file cannot grow
+        @{ pid = $TargetPid; count = $Count; ts = $Ts; heals = $keep } |
+            ConvertTo-Json -Compress | Set-Content -Path $StateFile -Encoding UTF8
+    } catch { }   # state is a convenience, not a precondition: an unwritable file must not stop the watchdog
 }
 
 function Write-Log {
@@ -132,7 +223,69 @@ if ($SelfTest) {
         if ($got -eq $c.want) { Write-Output "PASS: $($c.n) -> $got" }
         else { Write-Output "FAIL: $($c.n) -> got '$got', want '$($c.want)'"; $fail++ }
     }
-    Write-Output "$($cases.Count - $fail)/$($cases.Count) passed"
+
+    # --- wedged-app branch: one case per way it could misfire -------------------------
+    $NOW  = 1000000.0
+    $hung = @{ ProcId = 42; Responding = $false; AgeSec = 600 }
+    $armed = @{ pid = 42; count = 1; ts = ($NOW - 300) }
+    $hcases = @(
+        @{ n = 'hung: no windowed process (tray)'; w = @();          p = $armed; want = 'NONE' },
+        @{ n = 'hung: a window responds -> reset'; w = @(@{ ProcId = 42; Responding = $true;  AgeSec = 600 }); p = $armed; want = 'NONE' },
+        @{ n = 'hung: first tick does not heal';   w = @($hung);      p = $null;  want = 'ARM'  },
+        @{ n = 'hung: second tick heals';          w = @($hung);      p = $armed; want = 'HEAL' },
+        @{ n = 'hung: stale state = first tick';   w = @($hung);      p = @{ pid = 42; count = 1; ts = ($NOW - 9000) }; want = 'ARM' },
+        @{ n = 'hung: different pid = restart';    w = @($hung);      p = @{ pid = 7;  count = 1; ts = ($NOW - 300) };  want = 'ARM' },
+        @{ n = 'hung: young process is not judged'; w = @(@{ ProcId = 42; Responding = $false; AgeSec = 10 }); p = $armed; want = 'NONE' },
+        @{ n = 'hung: one of two windows alive';   w = @($hung, @{ ProcId = 43; Responding = $true; AgeSec = 600 }); p = $armed; want = 'NONE' }
+    )
+    foreach ($c in $hcases) {
+        $r = Get-HungVerdict -Windowed $c.w -Prior $c.p -NowEpoch $NOW
+        if ($r.Verdict -eq $c.want) { Write-Output "PASS: $($c.n) -> $($r.Verdict)" }
+        else { Write-Output "FAIL: $($c.n) -> got '$($r.Verdict)', want '$($c.want)' ($($r.Reason))"; $fail++ }
+    }
+    # NB: in PowerShell the comma binds tighter than arithmetic, so @($NOW - 600, $NOW - 1200)
+    # is parsed as a subtraction of arrays and throws. Each element needs its own parentheses.
+    $freshHeals = @([double]($NOW - 600), [double]($NOW - 1200), [double]($NOW - 1800))
+    $oldHeals   = @([double]($NOW - 30000), [double]($NOW - 40000), [double]($NOW - 50000))
+    $r = Get-HungVerdict -Windowed @($hung) -Prior $armed -NowEpoch $NOW -RecentHeals $freshHeals
+    if ($r.Verdict -eq 'BRAKE') { Write-Output 'PASS: hung: 3 heals in 6h -> BRAKE' }
+    else { Write-Output "FAIL: hung: brake -> got '$($r.Verdict)', want 'BRAKE'"; $fail++ }
+    $r = Get-HungVerdict -Windowed @($hung) -Prior $armed -NowEpoch $NOW -RecentHeals $oldHeals
+    if ($r.Verdict -eq 'HEAL') { Write-Output "PASS: hung: yesterday's heals do not brake" }
+    else { Write-Output "FAIL: hung: stale heals -> got '$($r.Verdict)', want 'HEAL'"; $fail++ }
+    $total = $cases.Count + $hcases.Count + 2
+
+    # --- the counter travels through DISK, so test that wiring too ---------------------
+    $realState = $StateFile
+    $StateFile = Join-Path $env:TEMP ("cdw-selftest-{0}.state" -f $PID)
+    if (Test-Path $StateFile) { Remove-Item $StateFile -Force }
+    try {
+        $T = 2000000.0
+        $v = Get-HungVerdict -Windowed @($hung) -Prior (Read-HungState) -NowEpoch $T
+        Write-HungState $v.ProcId $v.Count $T @()
+        $s = Read-HungState
+        if ($s -and [int]$s.count -eq 1 -and [int]$s.pid -eq 42) { Write-Output 'PASS: state: count and pid survive the file' }
+        else { Write-Output "FAIL: state: count=$($s.count) pid=$($s.pid), want 1/42"; $fail++ }
+        $v = Get-HungVerdict -Windowed @($hung) -Prior $s -NowEpoch ($T + 300) -RecentHeals @($s.heals)
+        if ($v.Verdict -eq 'HEAL') { Write-Output 'PASS: state: second tick through disk heals' }
+        else { Write-Output "FAIL: state: second tick -> '$($v.Verdict)', want 'HEAL'"; $fail++ }
+        Write-HungState 0 0 ($T + 300) (@($s.heals) + ($T + 300))    # what the live HEAL branch writes
+        $s = Read-HungState
+        if ([int]$s.count -eq 0 -and @($s.heals).Count -eq 1) { Write-Output 'PASS: state: count reset, heal remembered' }
+        else { Write-Output "FAIL: state: count=$($s.count) heals=$(@($s.heals).Count), want 0/1"; $fail++ }
+        Set-Content -Path $StateFile -Value '{ not json at all' -Encoding UTF8
+        if ($null -eq (Read-HungState)) { Write-Output 'PASS: state: corrupt file reads as a clean slate' }
+        else { Write-Output 'FAIL: state: corrupt file did not read as null'; $fail++ }
+        Write-HungState 0 0 $T @([double]($T - 200000), [double]($T - 100), [double]($T - 50))
+        if (@((Read-HungState).heals).Count -eq 2) { Write-Output 'PASS: state: heals older than 24h are pruned' }
+        else { Write-Output 'FAIL: state: stale heals were not pruned'; $fail++ }
+        $total += 5
+    } finally {
+        if (Test-Path $StateFile) { Remove-Item $StateFile -Force -ErrorAction SilentlyContinue }
+        $StateFile = $realState
+    }
+
+    Write-Output "$($total - $fail)/$total passed"
     exit ([int]($fail -gt 0))
 }
 
@@ -169,7 +322,42 @@ try {
     $paths = @($desktopProcs | ForEach-Object { $_.Path })
 
     switch (Get-Decision -InstallLocation $loc -DesktopProcPaths $paths) {
-        'OK'         { Write-Log 'OK' "procs=$($paths.Count)" }
+        'OK' {
+            # Current-version processes are alive. But is the WINDOW alive?
+            $now      = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $st       = Read-HungState
+            $heals    = if ($st) { @($st.heals) } else { @() }
+            $windowed = @($desktopProcs |
+                Where-Object { $_.MainWindowHandle -ne 0 -and $_.Path -like "$loc*" } |
+                ForEach-Object {
+                    $age = 99999
+                    try { $age = [int]((Get-Date) - $_.StartTime).TotalSeconds } catch { }
+                    @{ ProcId = $_.Id; Responding = $_.Responding; AgeSec = $age }
+                })
+            $v = Get-HungVerdict -Windowed $windowed -Prior $st -NowEpoch $now -RecentHeals $heals
+            switch ($v.Verdict) {
+                'NONE' {
+                    Write-HungState 0 0 $now $heals
+                    Write-Log 'OK' "procs=$($paths.Count) windowed=$($windowed.Count) hung=no ($($v.Reason))"
+                }
+                'ARM' {
+                    Write-HungState $v.ProcId $v.Count $now $heals
+                    Write-Log 'HUNG_ARMED' "pid=$($v.ProcId) $($v.Reason) -- healing next tick unless it answers"
+                }
+                'BRAKE' {
+                    Write-HungState $v.ProcId $v.Count $now $heals
+                    Write-Log 'HUNG_BRAKE' "pid=$($v.ProcId) NOT healing: $($v.Reason)"
+                }
+                'HEAL' {
+                    $ev = Save-Evidence 'HUNG'      # snapshot BEFORE the kill or there is no evidence
+                    $desktopProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 3
+                    Start-Process explorer.exe "shell:AppsFolder\$($pkg.PackageFamilyName)!Claude"
+                    Write-HungState 0 0 $now (@($heals) + $now)
+                    Write-Log 'HEALED_HUNG' "killed=$($desktopProcs.Count) wedged procs (pid $($v.ProcId), $($v.Reason)); relaunched; evidence=$ev"
+                }
+            }
+        }
         'NO_PACKAGE' { Write-Log 'NO_PACKAGE' 'Claude MSIX package not found' }
         'LAUNCH' {
             Start-Process explorer.exe "shell:AppsFolder\$($pkg.PackageFamilyName)!Claude"
