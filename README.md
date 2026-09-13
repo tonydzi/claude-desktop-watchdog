@@ -3,10 +3,10 @@
 **Claude Desktop on Windows will not reopen, and clicking the icon does nothing. You reboot. You should not have to.**
 
 A dead instance keeps holding the single-instance lock, so every click on the icon is
-swallowed by a process that will never draw a window again. Rebooting works because it
-kills the survivor. So does this, every five minutes, without taking your machine down.
+swallowed by a process that will never draw a window again — the shape reported in [#84410](https://github.com/anthropics/claude-code/issues/84410). Rebooting works because it
+kills the survivor. So does [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1), every five minutes, without taking your machine down.
 
-One PowerShell file. No modules, no network, no telemetry. MIT.
+One PowerShell file, [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1): no modules, no network, no telemetry, licensed [MIT](LICENSE).
 
 ```powershell
 git clone https://github.com/tonydzi/claude-desktop-watchdog
@@ -29,14 +29,14 @@ Remove it with `-Uninstall`, then delete
 | only older-version processes | kills them, then launches |
 
 "Older-version" means the executable path is not under the `InstallLocation` that
-`Get-AppxPackage` reports right now. After an MSIX update, a survivor of the previous
-package looks exactly like that.
+`Get-AppxPackage` reports right now, and that comparison is the whole decision in [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1).
+After an MSIX update, a survivor of the previous package looks exactly like that, which is the failure in [#69987](https://github.com/anthropics/claude-code/issues/69987).
 
 ## The other failure: alive but wedged (v0.2)
 
 Processes are current, the app is "running", and the window is dead. Clicking the icon
-still does nothing, because the frozen instance owns the lock. Killing the process list is
-the known recovery; the point of a watchdog is to notice without you.
+still does nothing, because the frozen instance owns the lock, exactly as described in [#84410](https://github.com/anthropics/claude-code/issues/84410).
+Killing the process list is the known recovery named in that same report; the point of a watchdog is to notice without you.
 
 | what it sees | what it does |
 |---|---|
@@ -46,20 +46,20 @@ the known recovery; the point of a watchdog is to notice without you.
 | 3 heals inside 6 hours | `HUNG_BRAKE` — stops healing, says so |
 
 `Responding` is a ping of the UI thread, and a ping is not a diagnosis: it goes false while
-the app is merely busy and during the first seconds of startup. Everything here is aimed at
-that one weakness.
+the app is merely busy and during the first seconds of startup. Every guard below in [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1)
+is aimed at that one weakness.
 
 - **Two consecutive ticks on the same pid.** A different pid means the app already
   restarted, so the counter starts over rather than inheriting someone else's freeze. The
   tracked pid is the one from last tick if it is still wedged, otherwise the lowest — not
   "first in the array", because `Get-Process` order is not guaranteed and with two wedged
   windows the counter would hop between pids and never reach two.
-- **90-second startup grace.** A window that has not finished coming up is not wedged.
+- **90-second startup grace.** A window that has not finished coming up is not wedged, and the grace value sits at the top of [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1).
 - **State older than 20 minutes is stale.** Sleep, reboot, and skipped ticks must not add
-  up to "two ticks in a row" across a weekend.
+  up to "two ticks in a row" across a weekend, so [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1) dates every counter it writes.
 - **One live window is enough.** If any window answers, nothing is killed — a second,
-  wedged window never costs you the healthy one.
-- **Crash-loop brake.** Three heals in six hours means restarting is not the fix, so it
+  wedged window never costs you the healthy one, which is the first branch [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1) checks.
+- **Crash-loop brake.** Three heals in six hours means restarting is not the fix, so [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1)
   stops and leaves `HUNG_BRAKE` in the log for a human.
 - **Minimized to the tray → `MainWindowHandle` is 0 → nothing is judged.** Failing open is
   the right side to fail on: the cost of a missed heal is a manual restart, the cost of a
@@ -67,7 +67,7 @@ that one weakness.
 
 The counter lives in `%USERPROFILE%\.claude\logs\claude_desktop_watchdog.state`. Deleting
 it is safe; a corrupt one is read as an empty one, because a watchdog that dies on its own
-state file is worse than no watchdog.
+state file is worse than no watchdog — that round-trip is one of the fixtures [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1) self-tests.
 
 **Two things it will never touch.** `claude-code` CLI sessions, because the filter is
 strictly `C:\Program Files\WindowsApps\Claude_*` and the CLI lives under
@@ -85,7 +85,7 @@ processes and relaunching recovers it") and [#69987](https://github.com/anthropi
 (an update aborts with `0x80073D02`, "the package could not be installed because the
 following app must be closed", leaving the package unable to launch).
 
-What we verified on our own machine: both decision tables against 22 fixtures, including
+What we verified on our own machine, 2026-08-11: both decision tables against 22 fixtures, including
 the state file round-trip and a deliberately corrupted one; the self-test going red under
 three mutations (heal on the first tick, ignore a responding window, pick the target by
 array position); a live run on a healthy
@@ -102,7 +102,7 @@ snapshot first — which is the other half of this repo.
 ## Capturing evidence instead of a story
 
 The reason the failure survives is that by the time anyone describes it, the machine is
-healthy again and there is nothing left to inspect. Every healing run writes one file to
+healthy again and there is nothing left to inspect, which is why [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1) writes the snapshot before it heals. Every healing run writes one file to
 `%USERPROFILE%\.claude\logs\desktop-incidents\` with the four things a maintainer will ask
 for:
 
@@ -131,7 +131,7 @@ explorer.exe shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude
 ```
 
 This kills *all* Desktop processes including healthy ones, which is fine when the app is
-already wedged and is why the scheduled version is narrower.
+already wedged and is why the scheduled version in [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1) is narrower.
 
 ## Log
 
@@ -144,12 +144,14 @@ One JSON line per run to `%USERPROFILE%\.claude\logs\claude_desktop_watchdog.jso
 Outcomes: `OK` · `LAUNCHED` · `KILLED_STALE` · `HEALED` · `HUNG_ARMED` · `HEALED_HUNG` ·
 `HUNG_BRAKE` · `NO_PACKAGE` · `CRASH`.
 
-`OK` is the boring case and should be almost every line. `HEALED` and `HEALED_HUNG` are the
+`OK` is the boring case and should be almost every line [claude_desktop_watchdog.ps1](claude_desktop_watchdog.ps1) writes. `HEALED` and `HEALED_HUNG` are the
 ones worth grepping for — they mean the class is real on your machine too, and there is a
 snapshot to go with it. `HUNG_ARMED` with no `HEALED_HUNG` after it is the good outcome:
 the app answered on its own and nothing was killed.
 
 ---
+
+Published 2026-08-11, licensed [MIT](LICENSE), cite via [CITATION.cff](CITATION.cff); an agent reading this repo should start at [FOR-ROBOTS.md](FOR-ROBOTS.md).
 
 Built at [Palo Alto AI Research Lab](https://github.com/tonydzi) while running a fleet of
 Claude machines. Sibling repo for macOS session hygiene:
