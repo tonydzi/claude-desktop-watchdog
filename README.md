@@ -8,7 +8,7 @@ A small Windows script that notices when Claude Desktop is stuck and cannot reop
 ## Quick start
 1. Download the repo (git clone, or the green "Code" button, then "Download ZIP") and open PowerShell in that folder.
 2. Check the script first. This changes nothing: `powershell -ExecutionPolicy Bypass -File .\claude_desktop_watchdog.ps1 -SelfTest`
-3. Turn it on: `powershell -ExecutionPolicy Bypass -File .\claude_desktop_watchdog.ps1 -Install`
+3. Turn it on: `powershell -ExecutionPolicy Bypass -File .\claude_desktop_watchdog.ps1 -Install`. Heads up: this also runs the job once right away. If Claude Desktop is not open at that moment it will be opened for you; if a dead copy is found it is closed and reopened. Save your work in Desktop first.
 
 **Done when:** step 2 ends with `22/22 passed`, and after step 3 the Windows Task Scheduler lists a task named `Claude-Desktop-Watchdog`.
 
@@ -20,7 +20,7 @@ A small Windows script that notices when Claude Desktop is stuck and cannot reop
 ### Preconditions
 - Windows with Windows PowerShell 5.1 or newer. Claude Desktop installed as the Microsoft Store (MSIX) package. On other systems the script does nothing useful.
 - No modules, no network, no accounts, no keys.
-- Ask the human before `-Install`: it creates a scheduled task that runs every 5 minutes and can kill and relaunch Claude Desktop.
+- Ask the human before `-Install`: it creates a scheduled task that runs every 5 minutes and can kill and relaunch Claude Desktop. `-Install` also starts the task once immediately (`schtasks /Run`), so the first heal or launch can happen during the install itself.
 
 ### Install
 ```powershell
@@ -38,7 +38,7 @@ No configuration file. The paths and task name are variables at the top of `clau
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\claude_desktop_watchdog.ps1 -SelfTest
 ```
-Expected: exit code 0 and a last line `22/22 passed`. After `-Install`, check the task exists with `schtasks /Query /TN Claude-Desktop-Watchdog`, and read the last line of `%USERPROFILE%\.claude\logs\claude_desktop_watchdog.jsonl`: on a healthy machine the outcome is `OK`.
+Expected: exit code 0 and a last line `22/22 passed`. After `-Install`, check the task exists with `schtasks /Query /TN Claude-Desktop-Watchdog`, and read the last line of `%USERPROFILE%\.claude\logs\claude_desktop_watchdog.jsonl` (PowerShell: `Get-Content $env:USERPROFILE\.claude\logs\claude_desktop_watchdog.jsonl -Tail 1`). The outcome depends on what Desktop was doing: `OK` when it is running and healthy; `LAUNCHED` when it was not running and the task opened it; `HEALED` or `KILLED_STALE` when a dead older copy was cleaned up; `NO_PACKAGE` when Claude Desktop is not installed as the Microsoft Store package (the watchdog then does nothing, so the install is useless on that machine); `CRASH` is a failure, read its `detail`. To prove the task really ran, not just that it exists, run `schtasks /Query /TN Claude-Desktop-Watchdog /V /FO LIST` and check `Last Run Time` is recent and `Last Result` is `0`, and that the log line's `ts` (UTC) is within the last 5 minutes after waiting one interval. A task that exists but has never written a new log line is not working.
 
 ### Uninstall / rollback
 ```powershell
